@@ -51,7 +51,7 @@ impl<N: GossipNetwork, S: Storage, R: RawRepository> SimperbyApi for Node<N, S, 
 
     async fn vote(&self, agenda_commit: CommitHash) -> Result<()> {
         let repo =
-            DistributedRepository::new(R::open(&self.config.repository_directory).await?).await?;
+            DistributedRepository::new(R::open(&self.config.repository_directory)?).await?;
         let valid_agendas = repo.get_agendas().await?;
         let agenda_hash = if let Some(x) = valid_agendas.iter().find(|(x, _)| *x == agenda_commit) {
             x.1

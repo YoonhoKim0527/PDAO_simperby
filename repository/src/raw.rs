@@ -5,6 +5,8 @@ use thiserror::Error;
 use git2::{Repository, BranchType, Oid, ObjectType};
 use std::str;
 use std::convert::TryFrom;
+use std::sync::Arc;
+use std::sync::Mutex;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -36,7 +38,7 @@ pub struct SemanticCommit {
 ///
 /// It automatically locks the repository once created.
 #[async_trait]
-pub trait RawRepository {
+pub trait RawRepository: Send + Sync + 'static {
     /// Initialize the genesis repository from the genesis working tree.
     ///
     /// Fails if there is already a repository.
@@ -203,7 +205,7 @@ pub trait RawRepository {
 }
 
 pub struct CurRepository {
-    repo: Repository
+    repo: Mutex<Repository>
 }
 
 //TODO: error handling, error name
@@ -220,6 +222,8 @@ impl RawRepository for CurRepository{
                 Err(_e) => {
                     let repo = Repository::init(directory)
                         .map_err(|e| Error::from(e))?;
+
+                    let repo = Mutex::new(repo);//Arc::new(Mutex::new(repo));
                     Ok(Self{ repo })
             }   
         }
@@ -230,6 +234,7 @@ impl RawRepository for CurRepository{
     where
         Self: Sized {
             let repo = Repository::open(directory).map_err(|e| Error::from(e))?;
+            let repo = Mutex::new(repo);
             Ok(Self{ repo })
         }
 
@@ -239,7 +244,10 @@ impl RawRepository for CurRepository{
 
     /// Returns the list of branches.
     fn list_branches(&self) -> Result<Vec<Branch>, Error> {
-        let branches = self.repo.branches(Option::Some(BranchType::Local))
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+        let branches = repo
+            .branches(Option::Some(BranchType::Local))
             .map_err(|e| Error::from(e))?;
 
         let branch_name_list = branches.map(|branch| {
@@ -261,15 +269,20 @@ impl RawRepository for CurRepository{
         branch_name: &Branch,
         commit_hash: CommitHash,
     ) -> Result<(), Error>{
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
         let oid = Oid::from_bytes(&commit_hash.hash).map_err(|e| Error::from(e))?;
-        let commit = self.repo.find_commit(oid)
+        let commit = repo
+            .find_commit(oid)
             .map_err(|e| Error::from(e))?;
         
         //if force true and branch already exists, it replaces with new one
-        let _branch = self.repo.branch(
-            branch_name.as_str(),
-            &commit,
-            false
+        let _branch = repo
+            .branch(
+                branch_name.as_str(),
+                &commit,
+                false
             ).map_err(|e| Error::from(e))?;
         
         Ok(())
@@ -277,9 +290,13 @@ impl RawRepository for CurRepository{
 
     /// Gets the commit that the branch points to.
     fn locate_branch(&self, branch: &Branch) -> Result<CommitHash, Error>{
-        let branch = self.repo.find_branch(
-            branch, 
-            BranchType::Local
+        let repo = self.repo.lock()
+        .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let branch = repo
+            .find_branch(
+                branch, 
+                BranchType::Local
         ).map_err(|e| Error::from(e))?;
         let oid = branch.get().target()
             .ok_or(Error::Unknown("err".to_string()))?; 
@@ -297,9 +314,13 @@ impl RawRepository for CurRepository{
     /// Moves the branch.
     fn move_branch(&mut self, branch: &Branch, commit_hash: &CommitHash)
         -> Result<(), Error>{
-            let mut git2_branch = self.repo.find_branch(
-                branch, 
-                BranchType::Local
+            let repo = self.repo.lock()
+                .map_err(|e| Error::Unknown(e.to_string()))?;
+
+            let mut git2_branch = repo
+                .find_branch(
+                    branch, 
+                    BranchType::Local
             ).map_err(|e| Error::from(e))?;
             let oid = Oid::from_bytes(&commit_hash.hash)
                 .map_err(|e| Error::from(e))?;
@@ -313,12 +334,17 @@ impl RawRepository for CurRepository{
 
     /// Deletes the branch.
     fn delete_branch(&mut self, branch: &Branch) -> Result<(), Error>{
-        let mut git2_branch = self.repo.find_branch(
+        let repo = self.repo.lock()
+        .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let mut git2_branch = repo
+            .find_branch(
             branch, 
-            BranchType::Local
+                BranchType::Local
         ).map_err(|e| Error::from(e))?;
         
-        let current_branch = self.repo.head()
+        let current_branch = repo
+            .head()
             .map_err(|e| Error::from(e))?
             .shorthand()
             .ok_or(Error::Unknown("err".to_string()))?
@@ -329,7 +355,7 @@ impl RawRepository for CurRepository{
         }else{
             git2_branch.delete().map_err(|e| Error::from(e))
         };
-        println!("{:?}", res);
+
         res
     }
 
@@ -339,8 +365,11 @@ impl RawRepository for CurRepository{
 
     /// Returns the list of tags.
     fn list_tags(&self) -> Result<Vec<Tag>, Error>{
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
         //pattern defines what tags you want to get
-        let tag_array=  self.repo.tag_names( None)
+        let tag_array=  repo.tag_names( None)
             .map_err(|e| Error::from(e))?;
 
         let tag_list = tag_array.iter().map(|tag| {
@@ -354,15 +383,27 @@ impl RawRepository for CurRepository{
 
     /// Creates a tag on the given commit.
     fn create_tag(&mut self, tag: &Tag, commit_hash: &CommitHash) -> Result<(), Error>{
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
         let oid = Oid::from_bytes(&commit_hash.hash)
             .map_err(|e| Error::from(e))?;
 
-        let object = self.repo.find_object(
+        let object = repo.find_object(
             oid, 
             Some(ObjectType::Commit)
         ).map_err(|e| Error::from(e))?;
+        
+
+        let _lightweight_tag = repo.tag_lightweight(
+            tag.as_str(), 
+            &object, 
+            true
+        ).map_err(|e| Error::from(e))?;
+/*
         let tagger = self.repo.signature()
             .map_err(|e| Error::from(e))?;
+
         let tag_message = ""; //TODO: tag_message
 
         //if force true and tag already exists, it replaces with new one
@@ -372,14 +413,17 @@ impl RawRepository for CurRepository{
             &tagger, 
             tag_message, 
             false
-        ).map_err(|e| Error::from(e))?;
+        ).map_err(|e| Error::from(e))?;*/
 
         Ok(())
     }
 
     /// Gets the commit that the tag points to.
     fn locate_tag(&self, tag: &Tag) -> Result<CommitHash, Error>{
-        let reference = self.repo.find_reference(
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let reference = repo.find_reference(
             &("refs/tags/".to_owned() + tag) 
         ).map_err(|e| Error::from(e))?;
 
@@ -400,7 +444,10 @@ impl RawRepository for CurRepository{
 
     /// Removes the tag.
     fn remove_tag(&mut self, tag: &Tag) -> Result<(), Error>{
-        self.repo.tag_delete(tag.as_str()).map_err(|e| Error::from(e))
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        repo.tag_delete(tag.as_str()).map_err(|e| Error::from(e))
     }
     // ----------------------
     // Commit-related methods
@@ -445,16 +492,19 @@ impl RawRepository for CurRepository{
 
     /// Checkouts to the branch.
     fn checkout(&mut self, branch: &Branch) -> Result<(), Error>{
-        let obj = self.repo.revparse_single(
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let obj = repo.revparse_single(
             &("refs/heads/".to_owned() + branch)
         ).map_err(|e| Error::from(e))?;
 
-        self.repo.checkout_tree(
+        repo.checkout_tree(
             &obj,
             None
         ).map_err(|e| Error::from(e));
 
-        self.repo.set_head(
+        repo.set_head(
             &("refs/heads/".to_owned() + branch)
         ).map_err(|e| Error::from(e))?;
 
@@ -463,10 +513,13 @@ impl RawRepository for CurRepository{
 
     /// Checkouts to the commit and make `HEAD` in a detached mode.
     fn checkout_detach(&mut self, commit_hash: &CommitHash) -> Result<(), Error>{
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
         let oid = Oid::from_bytes(&commit_hash.hash)
             .map_err(|e| Error::from(e))?;
 
-        self.repo.set_head_detached(oid)
+        repo.set_head_detached(oid)
             .map_err(|e| Error::from(e));
 
         Ok(())
@@ -478,7 +531,10 @@ impl RawRepository for CurRepository{
 
     /// Returns the commit hash of the current HEAD.
     fn get_head(&self) -> Result<CommitHash, Error>{
-        let ref_head = self.repo.head()
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let ref_head = repo.head()
             .map_err(|e| Error::from(e))?;
         let oid = ref_head.target()
             .ok_or(Error::Unknown("err".to_string()))?;
@@ -492,14 +548,17 @@ impl RawRepository for CurRepository{
     ///
     /// Fails if the repository is empty.
     fn get_initial_commit(&self) -> Result<CommitHash, Error>{
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
         //check if the repository is empty
-        let _head = self.repo.head()
+        let _head = repo.head()
             .map_err(|_| Error::InvalidRepository("Repository is empty".to_string()))?;
 
         //TODO: A revwalk allows traversal of the commit graph defined by including one or
         //      more leaves and excluding one or more roots.
         //      --> revwalk can make error if there exists one or more roots...
-        let mut revwalk = self.repo.revwalk()?;
+        let mut revwalk = repo.revwalk()?;
 
         revwalk.push_head()
             .map_err(|e| Error::from(e))?;
@@ -539,9 +598,12 @@ impl RawRepository for CurRepository{
         commit_hash: &CommitHash,
         max: Option<usize>,
     ) -> Result<Vec<CommitHash>, Error>{
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
         let oid = Oid::from_bytes(&commit_hash.hash)
             .map_err(|e| Error::from(e))?;
-        let mut revwalk = self.repo.revwalk()?;
+        let mut revwalk = repo.revwalk()?;
 
         revwalk.push(oid)
             .map_err(|e| Error::from(e))?;
@@ -557,7 +619,7 @@ impl RawRepository for CurRepository{
         let oids_ancestor = if let Some(num_max) = max{
             for n in 0..num_max {
                 //TODO: Check first one should be commit_hash
-                let commit = self.repo.find_commit(oids[n])
+                let commit = repo.find_commit(oids[n])
                     .map_err(|e| Error::from(e))?;
                 let num_parents = commit.parents().len();
                 
@@ -572,7 +634,7 @@ impl RawRepository for CurRepository{
             
             loop{
                 //TODO: Check first one should be commit_hash
-                let commit = self.repo.find_commit(oids[i])
+                let commit = repo.find_commit(oids[i])
                     .map_err(|e| Error::from(e))?;
                 let num_parents = commit.parents().len();
                 
@@ -620,10 +682,13 @@ impl RawRepository for CurRepository{
         commit_hash1: &CommitHash,
         commit_hash2: &CommitHash,
     ) -> Result<CommitHash, Error>{
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
         let oid1 = Oid::from_bytes(&commit_hash1.hash).map_err(|e| Error::from(e))?;
         let oid2 = Oid::from_bytes(&commit_hash2.hash).map_err(|e| Error::from(e))?;
 
-        let oid_merge = self.repo.merge_base(oid1, oid2)
+        let oid_merge = repo.merge_base(oid1, oid2)
             .map_err(|e| Error::from(e))?;
         let commit_hash_merge: [u8; 20] = oid_merge.as_bytes().try_into()
             .map_err(|_| Error::Unknown("abc".to_string()))?; 
@@ -637,7 +702,10 @@ impl RawRepository for CurRepository{
 
     /// Adds a remote repository.
     fn add_remote(&mut self, remote_name: &str, remote_url: &str) -> Result<(), Error>{
-        let _remote = self.repo.remote(
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let _remote = repo.remote(
             remote_name, 
             remote_url
         ).map_err(|e| Error::from(e))?;
@@ -647,7 +715,10 @@ impl RawRepository for CurRepository{
 
     /// Removes a remote repository.
     fn remove_remote(&mut self, remote_name: &str) -> Result<(), Error>{
-        let _remote_delete = self.repo.remote_delete(
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let _remote_delete = repo.remote_delete(
             remote_name
         ).map_err(|e| Error::from(e))?;
 
@@ -666,7 +737,10 @@ impl RawRepository for CurRepository{
     ///
     /// Returns `(remote_name, remote_url)`.
     fn list_remotes(&self) -> Result<Vec<(String, String)>, Error>{
-        let remote_array = self.repo.remotes()
+        let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+        let remote_array = repo.remotes()
             .map_err(|e| Error::from(e))?;
 
         let remote_name_list = remote_array.iter().map(|remote| {
@@ -678,7 +752,10 @@ impl RawRepository for CurRepository{
         }).collect::<Result<Vec<String>, Error>>()?;
 
         let res = remote_name_list.iter().map(|name|{
-            let remote = self.repo.find_remote(
+            let repo = self.repo.lock()
+            .map_err(|e| Error::Unknown(e.to_string()))?;
+
+            let remote = repo.find_remote(
                 name.clone().as_str() 
             ).map_err(|e| Error::from(e))?;
 
@@ -698,6 +775,15 @@ impl RawRepository for CurRepository{
         &self,
     ) -> Result<Vec<(String, String, CommitHash)>, Error>{
         unimplemented!()
+        //let remote_list = self.list_remotes()
+          //  .map_err(|e| Error::from(e))?;
+
+            //repo.branch_remote_name(refname: branch) -> remote name
+            //branch경우 branches(type::remote)로 가능
+
+            //or reference_glob(refname)으로 remote name 주고 branch들 가져오기?
+
+        //unimplemented!()
         //TODO: remote_name - branch ??
         //1. get (remote_name, remote_url) from list_remotes
         //2. can get commit object from rev_single but don't know what remote contains what branches
@@ -707,12 +793,19 @@ impl RawRepository for CurRepository{
 
 #[cfg(test)]
 mod tests {
-    use git2::{Repository, RepositoryInitOptions, Oid, };
+    use git2::{Repository, RepositoryInitOptions, Oid, RemoteCallbacks, FetchOptions};
     use std::path::Path;
     use tempfile::TempDir;
+    use url::Url;
+    use std::cell::Cell;
+    use std::sync::Mutex;
     use crate::raw::{RawRepository, CurRepository};
     use crate::CommitHash;
 
+    fn path2url(path: &Path) -> String {
+        Url::from_file_path(path).unwrap().to_string()
+    }
+    
     //make a repository which includes one initial commit at "main" branch
     //this returns CurRepository containing the repository
     fn init_repository_with_initial_commit(path: &Path) -> CurRepository {
@@ -743,22 +836,25 @@ mod tests {
         }
         
         //create branch "main" at the initial commit
-        let cur_repo = CurRepository{ repo };
+        let repo = Mutex::new(repo);
+        let cur_repo = CurRepository{ repo};
         let hash = <[u8; 20]>::try_from(oid.as_bytes()).unwrap();
         cur_repo.create_branch(&("main".to_owned()), CommitHash{ hash });
-    
+        
         cur_repo
     }
 
     //initialize repository with empty commit and empty branch
+    
     #[test]
     fn init() {
         let td = TempDir::new().unwrap();
         let path = td.path();
         let cur_repo = CurRepository::init(path.to_str().unwrap()).unwrap();
+        let repo = cur_repo.repo.lock().unwrap();
 
-        assert!(!cur_repo.repo.is_bare());
-        assert!(cur_repo.repo.is_empty().unwrap());
+        assert!(!repo.is_bare());
+        assert!(repo.is_empty().unwrap());
     }
 
     //open existed repository and verifies whether it opens well
@@ -769,9 +865,11 @@ mod tests {
 
         let init_repo= init_repository_with_initial_commit(path);
         let open_repo = CurRepository::open(path.to_str().unwrap()).unwrap();
-
-        assert!(!open_repo.repo.is_bare());
-        assert!(!open_repo.repo.is_empty().unwrap());
+        {
+            let repo = open_repo.repo.lock().unwrap();
+            assert!(!repo.is_bare());
+            assert!(!repo.is_empty().unwrap());
+        }
 
         let branch_list_init = init_repo.list_branches().unwrap();
         let branch_list_open = open_repo.list_branches().unwrap();
@@ -787,6 +885,7 @@ mod tests {
      */
     //create "branch_1" at c1, create c2 at "main" branch, move "branch_1" head from c1 to c2
     //finally, "branch_1" is removed
+    
     #[test]
     fn branch(){
         let td = TempDir::new().unwrap();
@@ -813,15 +912,18 @@ mod tests {
 
         //make second commit with "main" branch
         {
-            let head_oid = cur_repo.repo.head().unwrap().target().unwrap();
-            let head_commit = cur_repo.repo.find_commit(head_oid).unwrap();
+            let repo = cur_repo.repo.lock().unwrap();
 
-            let mut index = cur_repo.repo.index().unwrap();
+            let head_oid = repo.head().unwrap().target().unwrap();
+            let head_commit = repo.find_commit(head_oid).unwrap();
+
+            let mut index = repo.index().unwrap();
             let id = index.write_tree().unwrap();
 
-            let tree = cur_repo.repo.find_tree(id).unwrap();
-            let sig = cur_repo.repo.signature().unwrap();
-            cur_repo.repo.commit(
+            let tree = repo.find_tree(id).unwrap();
+            let sig = repo.signature().unwrap();
+            
+            repo.commit(
                 Some("HEAD"), 
                 &sig, 
                 &sig, 
@@ -832,6 +934,7 @@ mod tests {
         }
         //move "branch_1" head to "main" head
         let main_commit_hash = cur_repo.locate_branch(&("main".to_owned())).unwrap();
+        
         cur_repo.move_branch(
             &("branch_1".to_owned()), 
             &main_commit_hash
@@ -854,6 +957,7 @@ mod tests {
         assert_eq!(res, "failure".to_owned());
     }
 
+    
     //create a tag and remove it
     #[test]
     fn tag(){
@@ -900,19 +1004,23 @@ mod tests {
 
         //create branch_1, branch_2 and commits
         {
-            let first_oid = cur_repo.repo.head().unwrap().target().unwrap();
-            let first_commit = cur_repo.repo.find_commit(first_oid).unwrap();
+            let repo = cur_repo.repo.lock().unwrap();
+
+            let first_oid = repo.head().unwrap().target().unwrap();
+            let first_commit = repo.find_commit(first_oid).unwrap();
+            
             let first_commit_hash = cur_repo.locate_branch(&("main".to_owned())).unwrap();
             cur_repo.create_branch(&("branch_1".to_owned()), first_commit_hash);
+            
 
             //make second commit at "main" branch
-            let mut index = cur_repo.repo.index().unwrap();
+            let mut index = repo.index().unwrap();
             let id = index.write_tree().unwrap();
 
-            let tree = cur_repo.repo.find_tree(id).unwrap();
-            let sig = cur_repo.repo.signature().unwrap();
+            let tree = repo.find_tree(id).unwrap();
+            let sig = repo.signature().unwrap();
 
-            let second_oid = cur_repo.repo.commit(
+            let second_oid = repo.commit(
                 Some("HEAD"), 
                 &sig, 
                 &sig, 
@@ -920,17 +1028,19 @@ mod tests {
                 &tree, 
                 &[&first_commit]
             ).unwrap();
-            let second_commit = cur_repo.repo.find_commit(second_oid).unwrap();
+            let second_commit =  repo.find_commit(second_oid).unwrap();
+            
             let second_commit_hash = cur_repo.locate_branch(&("main".to_owned())).unwrap();
             cur_repo.create_branch(&("branch_2".to_owned()), second_commit_hash);
+            
 
             //make third commit at "main" branch
-            let mut index = cur_repo.repo.index().unwrap();
+            let mut index = repo.index().unwrap();
             let id = index.write_tree().unwrap();
 
-            let tree = cur_repo.repo.find_tree(id).unwrap();
-            let sig = cur_repo.repo.signature().unwrap();
-            let _third_oid = cur_repo.repo.commit(
+            let tree = repo.find_tree(id).unwrap();
+            let sig = repo.signature().unwrap();
+            let _third_oid = repo.commit(
                 Some("HEAD"), 
                 &sig, 
                 &sig, 
@@ -957,7 +1067,7 @@ mod tests {
 
     }
 
-    
+    /*
     /*
         c2 (HEAD -> main)       c2 (main)
          |                 -->   |
@@ -1248,4 +1358,61 @@ mod tests {
         let remote_list = cur_repo.list_remotes().unwrap();
         assert_eq!(remote_list.len(), 0);
     }
+
+    #[test]
+    fn remote_test(){
+        let td1 = TempDir::new().unwrap();
+        let td2 = TempDir::new().unwrap();
+        let path1 = td1.path(); 
+        let path2 = td2.path(); 
+        let mut _repo= init_repository_with_initial_commit(path1);
+        let mut cur_repo= init_repository_with_initial_commit(path2);
+
+        let url = path2url(&path1);
+
+        let progress_hit = Cell::new(false);
+        {
+            let mut callbacks = RemoteCallbacks::new();
+            let mut origin = cur_repo.repo.remote("origin", &url).unwrap();
+
+            callbacks.transfer_progress(|_progress| {
+                progress_hit.set(true);
+                true
+            });
+            origin
+                .fetch(
+                    &[] as &[&str],
+                    Some(FetchOptions::new().remote_callbacks(callbacks)),
+                    None,
+                )
+                .unwrap();
+
+            let list = origin.list().unwrap();
+            assert_eq!(list.len(), 2);
+            assert_eq!(list[0].name(), "HEAD");
+            assert!(!list[0].is_local());
+            assert_eq!(list[1].name(), "refs/heads/main");
+            assert!(!list[1].is_local());
+        }
+        assert!(progress_hit.get());
+
+/*
+        //add dummy remote
+        cur_repo.add_remote("origin", "/path/to/nowhere");
+
+        let remote_list = cur_repo.list_remotes().unwrap();
+        assert_eq!(remote_list.len(), 1);
+        assert_eq!(remote_list[0].0, "origin".to_owned());
+        assert_eq!(remote_list[0].1, "/path/to/nowhere".to_owned());
+        {
+            let origin = cur_repo.repo.find_remote("origin").unwrap();
+            assert_eq!(origin.name(), Some("origin"));
+            assert_eq!(origin.url(), Some("/path/to/nowhere"));
+            assert_eq!(origin.pushurl(), None);
+        }
+        //remove dummy remote
+        cur_repo.remove_remote("origin");
+        let remote_list = cur_repo.list_remotes().unwrap();
+        assert_eq!(remote_list.len(), 0);*/
+    }*/
 }
