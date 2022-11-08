@@ -108,3 +108,5 @@ impl BlockHeader {
 
     // note that `repository_merkle_root` is calculated from `simperby-repository`.
 }
+
+//hash test
