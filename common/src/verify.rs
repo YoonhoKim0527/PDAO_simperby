@@ -99,3 +99,5 @@ impl CommitSequenceVerifier {
         unimplemented!()
     }
 }
+
+// 왜 안됨?
