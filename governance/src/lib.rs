@@ -80,9 +80,15 @@ impl<N: GossipNetwork, S: Storage> Governance<N, S> {
     /// Serves the governance protocol indefinitely.
     pub async fn serve(
         self,
-        _network_config: &NetworkConfig,
-        _peers: SharedKnownPeers,
+        network_config: &NetworkConfig,
+        peers: SharedKnownPeers,
     ) -> Result<tokio::task::JoinHandle<Result<(), Error>>, Error> {
-        unimplemented!()
+        const RPC_PORT: u16 = 123;
+        let network_config_clone = network_config.clone();
+        let serve = self
+            .dms
+            .serve(network_config_clone, RPC_PORT, peers)
+            .await?;
+        Ok(serve)
     }
 }
