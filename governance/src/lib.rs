@@ -84,11 +84,10 @@ impl<N: GossipNetwork, S: Storage> Governance<N, S> {
         peers: SharedKnownPeers,
     ) -> Result<tokio::task::JoinHandle<Result<(), Error>>, Error> {
         const RPC_PORT: u16 = 123;
-        let network_config_clone = network_config.clone();
-        let serve = self
+        let join_handle = self
             .dms
-            .serve(network_config_clone, RPC_PORT, peers)
+            .serve(network_config.clone(), RPC_PORT, peers)
             .await?;
-        Ok(serve)
+        Ok(join_handle)
     }
 }
