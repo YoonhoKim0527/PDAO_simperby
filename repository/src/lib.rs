@@ -142,7 +142,7 @@ impl<T: RawRepository> DistributedRepository<T> {
     ) -> Result<CommitHash, Error> {
         unimplemented!()
     }
-    
+
     /// Creates an agenda commit on top of the `work` branch.
     pub async fn create_agenda(&mut self, author: PublicKey) -> Result<CommitHash, Error> {
         let last_header = self.get_last_finalized_block_header().await?;
@@ -241,3 +241,5 @@ impl<T: RawRepository> DistributedRepository<T> {
         unimplemented!()
     }
 }
+
+//clonetest
