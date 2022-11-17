@@ -4,7 +4,7 @@ pub mod raw;
 use anyhow::anyhow;
 use format::*;
 use futures::prelude::*;
-use raw::RawRepository;
+use raw::{RawRepository, SemanticCommit};
 use serde::{Deserialize, Serialize};
 use simperby_common::reserved::ReservedState;
 use simperby_common::verify::CommitSequenceVerifier;
@@ -54,16 +54,30 @@ impl<T: RawRepository> DistributedRepository<T> {
 
     /// Initializes the genesis repository from the genesis working tree.
     pub async fn genesis(&mut self) -> Result<(), Error> {
-        unimplemented!()
+        //let genesis_info = self.get_reserved_state().await?.genesis_info;
+        Ok(())
     }
     /// Returns the block header from the `main` branch.
     pub async fn get_last_finalized_block_header(&self) -> Result<BlockHeader, Error> {
-        unimplemented!()
+        let commit_hash = self
+            .raw
+            .locate_branch(&FINALIZED_BRANCH_NAME.into())
+            .await?;
+        let semantic_commit = self.raw.read_semantic_commit(&commit_hash).await?;
+        let block_header: BlockHeader = serde_json::from_str(&semantic_commit.body)?;
+        Ok(block_header)
     }
 
-    /// Returns the reserved state from the `main` branch.
+    /// Returns the reserved state from the 'finalized' branch.
     pub async fn get_reserved_state(&self) -> Result<ReservedState, Error> {
-        unimplemented!()
+        let commit_hash = self
+            .raw
+            .locate_branch(&FINALIZED_BRANCH_NAME.into())
+            .await?;
+        let semantic_commit: SemanticCommit = self.raw.read_semantic_commit(&commit_hash).await?;
+        semantic_commit
+            .reserved_state
+            .ok_or(anyhow::anyhow!("There is no reserved state"))
     }
 
     /// Fetches new commits from the network.
@@ -134,10 +148,16 @@ impl<T: RawRepository> DistributedRepository<T> {
     /// It will verify the finalization proof and the commits.
     pub async fn finalize(
         &mut self,
-        _block_commit_hash: &CommitHash,
-        _proof: &FinalizationProof,
+        block_commit_hash: &CommitHash,
+        proof: &FinalizationProof,
     ) -> Result<(), Error> {
-        unimplemented!()
+        let semantic_commit = self.raw.read_semantic_commit(&block_commit_hash).await?;
+        let block_header: BlockHeader = serde_json::from_str(&semantic_commit.body)?;
+        verify::verify_finalization_proof(&block_header, proof)?;
+
+        //TODO: verify commits
+
+        Ok(())
     }
 
     /// Informs that the given agenda has been approved.
