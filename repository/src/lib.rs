@@ -72,7 +72,7 @@ impl<T: RawRepository> DistributedRepository<T> {
     pub async fn fetch(
         &mut self,
         _network_config: &NetworkConfig,
-        _known_peers: &[Peer],
+        known_peers: &[Peer],
     ) -> Result<(), Error> {
         for peer in known_peers {
             let commit: Commit = serde_json::from_str(&*peer.message)?;
