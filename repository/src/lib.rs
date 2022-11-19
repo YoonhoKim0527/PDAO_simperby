@@ -74,7 +74,14 @@ impl<T: RawRepository> DistributedRepository<T> {
         _network_config: &NetworkConfig,
         _known_peers: &[Peer],
     ) -> Result<(), Error> {
-        unimplemented!()
+        for peer in known_peers {
+            let commit: Commit = serde_json::from_str(&*peer.message)?;
+            let block_header = self.get_last_finalized_block_header().await?;
+            let reserved_state = self.get_reserved_state().await?;
+            let mut csv = verify::CommitSequenceVerifier::new(block_header, reserved_state)?;
+            verify::CommitSequenceVerifier::apply_commit(&mut csv, &commit)?;
+        }
+        Ok(())
     }
 
     /// Notifies there was a push for the given repository.
