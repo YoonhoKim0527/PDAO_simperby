@@ -142,7 +142,7 @@ impl<T: RawRepository> DistributedRepository<T> {
     /// - It may add some `a-#` branches.
     /// - It may add some `b-#` branches.
     ///
-    /// It may leave some remote repository (representing each peer) after the operation.
+    /// It may leave some remote branches (repositories representing each peer) after the operation.
     pub async fn fetch(
         &mut self,
         _network_config: &NetworkConfig,
@@ -159,143 +159,102 @@ impl<T: RawRepository> DistributedRepository<T> {
 
         self.raw.fetch_all().await?;
 
-        let branches_after_fetch = self.raw.list_branches().await?;
-
-        // Make block_header_vec to contain BlockHeaders below,
-        // and make block_commit_hash_vec to contain CommitHash
-        let mut block_header_vec: Vec<BlockHeader> = vec![];
-        let mut finalized_branches: Vec<Branch> = vec![];
-
-        // For all incoming branches
-        for branch in branches_after_fetch {
-            // Delete branches which merge base is not the known finalized commit
-            let branch_commit_hash = self.raw.locate_branch(branch.clone()).await?;
-            let finalized_branch_commit_hash =
-                self.raw.locate_branch(FINALIZED_BRANCH_NAME.into()).await?;
-
+        // For all incoming branches, verify all the incoming commits and apply them to the local repository only if they are valid.
+        let branches = self.raw.list_branches().await?;
+        let finalized_branch_commit_hash =
+            self.raw.locate_branch(FINALIZED_BRANCH_NAME.into()).await?;
+        let last_header = self.get_last_finalized_block_header().await?;
+        let reserved_state = self.get_reserved_state().await?;
+        'branch: for branch in branches {
+            let branch_tip_commit_hash = self.raw.locate_branch(branch.clone()).await?;
+            // Check if the branch is rebased on top of the `finalized` branch.
             if finalized_branch_commit_hash
                 != self
                     .raw
-                    .find_merge_base(branch_commit_hash, finalized_branch_commit_hash)
+                    .find_merge_base(branch_tip_commit_hash, finalized_branch_commit_hash)
                     .await?
             {
                 self.raw.delete_branch(branch.to_string()).await?;
-                // Jump to the next branch
                 continue;
             }
 
-            // Make new CSV for the branch
-            let blockheader = self.get_last_finalized_block_header().await?;
-            let branch_reserved_state = self.get_reserved_state().await?;
-            let mut branch_csv =
-                verify::CommitSequenceVerifier::new(blockheader.clone(), branch_reserved_state)
-                    .unwrap();
-
-            // Find new commits (after the finalized commit)
-            let branch_semantic_commit = self.raw.read_semantic_commit(branch_commit_hash).await?;
-            let _branch_commit =
-                format::from_semantic_commit(branch_semantic_commit).map_err(|e| anyhow!(e))?;
-
-            let branch_ancestors = self.raw.list_ancestors(branch_commit_hash, None).await?;
-            let finalized_ancestors = self
+            // Construct a commit list starting from the next commit of the last finalized block to the `branch_tip_commit`(the most recent commit of the branch)
+            let ancestor_commits = self
                 .raw
-                .list_ancestors(finalized_branch_commit_hash, None)
+                .list_ancestors(branch_tip_commit_hash, Some(256))
                 .await?;
-
-            let new_commits_hashes: Vec<CommitHash> = branch_ancestors
+            let position = ancestor_commits
+                .iter()
+                .position(|c| *c == finalized_branch_commit_hash)
+                .expect("TODO: handle the case where it exceeds the limit");
+            let new_semantic_commits = stream::iter(
+                ancestor_commits
+                    .iter()
+                    .take(position)
+                    .rev()
+                    .cloned()
+                    .map(|c| {
+                        let raw = &self.raw;
+                        async move { raw.read_semantic_commit(c).await.map(|x| (x, c)) }
+                    }),
+            )
+            .buffered(256)
+            .collect::<Vec<_>>()
+            .await;
+            let mut new_semantic_commits = new_semantic_commits
                 .into_iter()
-                .filter(|hash| !finalized_ancestors.contains(hash))
-                .collect();
-
-            let new_commits_hashes_cloned = new_commits_hashes.clone();
-            let tip_commit_hash = new_commits_hashes_cloned.last().unwrap();
-            let tip_semantic_commit = self.raw.read_semantic_commit(*tip_commit_hash).await?;
-            let tip_commit =
-                format::from_semantic_commit(tip_semantic_commit).map_err(|e| anyhow!(e))?;
-
-            for new_commit_hash in new_commits_hashes {
-                // Verify with CSV about every new commits
-                let semantic_commit = self.raw.read_semantic_commit(new_commit_hash).await?;
-                let new_commit =
-                    format::from_semantic_commit(semantic_commit).map_err(|e| anyhow!(e))?;
-                verify::CommitSequenceVerifier::apply_commit(&mut branch_csv, &new_commit).unwrap();
-            }
-
-            // If new commit is Agenda commit or AgendaProof commit
-            if let Commit::Agenda(_) = tip_commit {
-                let branch_name = "a-#"; //TODO : change # into number
-                self.raw
-                    .create_branch(branch_name.to_string(), *tip_commit_hash)
-                    .await?;
-            } else if let Commit::AgendaProof(_) = tip_commit {
-                let branch_name = "a-#"; //TODO : change # into number
-                self.raw
-                    .create_branch(branch_name.to_string(), *tip_commit_hash)
-                    .await?;
-            } else if let Commit::Block(commit_block_header) = tip_commit {
-                // Else if new commit is Block commit, add block_header, block_header_hash into the vector
-                // Then we find fp, if there is fp then move the finalized branch
-                let fp_commit_hash = self.raw.locate_branch(FP_BRANCH_NAME.into()).await?;
-                let fp_semantic_commit = self.raw.read_semantic_commit(fp_commit_hash).await?;
-                let finalization_proof: FinalizationProof =
-                    serde_json::from_str(&fp_semantic_commit.body).unwrap();
-                let result = verify::verify_finalization_proof(
-                    block_header_vec.get(0).unwrap(),
-                    &finalization_proof,
-                );
-                // If the finalization proof is right, we push it to a vector to check
-                // If we can't find the right finalization proof, we create a new b# branch
-                match result {
-                    Ok(()) => {
-                        block_header_vec.push(commit_block_header);
-                        finalized_branches.push(branch);
-                    }
-                    Err(_) => {
-                        self.raw
-                            .create_branch("b-#".to_string(), *tip_commit_hash)
-                            .await?
-                    }
-                };
-            }
-            // For fast-forward branches
-            else {
-                self.raw.move_branch(branch, *tip_commit_hash).await?;
-            }
-        }
-        // Check the finalized branch's tip block commit height
-        // Delete all branches which is finalized but do not have the highest height
-        // Panic if there is 2 or more same height finalized branches
-        // Else we move the finalized branch
-        let block_heights: Vec<u64> = block_header_vec
-            .iter()
-            .map(|blockheader| blockheader.height)
-            .collect();
-        let highest_block_height = *block_heights.iter().max().unwrap();
-        let mut same_height_finalized_block_count = 0;
-        let mut survived_finalized_branch_index = None;
-        for (index, block_height) in block_heights.iter().enumerate() {
-            if highest_block_height == *block_height {
-                same_height_finalized_block_count += 1;
-                survived_finalized_branch_index = Some(index);
-            } else {
-                let to_be_deleted_branch_name = finalized_branches.get(index).unwrap().clone();
-                self.raw.delete_branch(to_be_deleted_branch_name).await?;
-            }
-        }
-        if same_height_finalized_block_count > 1 {
-            panic!("chain forked");
-        } else {
-            let survived_branch_name = finalized_branches
-                .get(survived_finalized_branch_index.unwrap())
-                .unwrap()
-                .clone();
-            let survived_tip_commit = self.raw.locate_branch(survived_branch_name).await?;
-            self.raw
-                .move_branch(FINALIZED_BRANCH_NAME.to_string(), survived_tip_commit)
+                .collect::<Result<Vec<_>, _>>()?;
+            // Add most recent commit of the branch to the list since it is not included in the ancestor commits
+            let branch_tip_semantic_commit = self
+                .raw
+                .read_semantic_commit(branch_tip_commit_hash)
                 .await?;
-        }
-        //TODO: update fp branch
+            new_semantic_commits.push((branch_tip_semantic_commit, branch_tip_commit_hash));
+            let new_commits = new_semantic_commits
+                .into_iter()
+                .map(|(commit, hash)| {
+                    from_semantic_commit(commit)
+                        .map_err(|e| (e, hash))
+                        .map(|x| (x, hash))
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|(error, hash)| {
+                    anyhow!("failed to convert the commit {}: {}", hash, error)
+                })?;
 
+            // Verify all the incoming commits and apply them to the local repository only if they are valid.
+            let mut verifier =
+                CommitSequenceVerifier::new(last_header.clone(), reserved_state.clone())
+                    .map_err(|e| anyhow!("failed to create a verifier: {}", e))?;
+            for (new_commit, _) in &new_commits {
+                if verifier.apply_commit(new_commit).is_err() {
+                    continue 'branch;
+                }
+            }
+            let branch_tip_commit = &new_commits.last().unwrap().0;
+            if let Commit::Agenda(_) = branch_tip_commit {
+                // If branch tip commit is Agenda commit, create a new agenda branch
+                let branch_name = "a-#"; //TODO : change # into number
+                self.raw
+                    .create_branch(branch_name.to_string(), branch_tip_commit_hash)
+                    .await?;
+            } else if let Commit::AgendaProof(_) = branch_tip_commit {
+                // Else if branch tip commit is AgendaProof commit, create a new agenda branch
+                let branch_name = "a-#"; //TODO : change # into number
+                self.raw
+                    .create_branch(branch_name.to_string(), branch_tip_commit_hash)
+                    .await?;
+            } else if let Commit::Block(_block_header) = branch_tip_commit {
+                // Else if branch tip commit is Block commit, create a new block branch
+                let branch_name = "b-#"; //TODO : change # into number
+                self.raw
+                    .create_branch(branch_name.to_string(), branch_tip_commit_hash)
+                    .await?;
+            } else {
+                // Else, fast-forward branches
+                self.raw.move_branch(branch, branch_tip_commit_hash).await?;
+            }
+        }
         Ok(())
     }
 
