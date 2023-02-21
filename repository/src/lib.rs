@@ -204,25 +204,18 @@ impl<T: RawRepository> DistributedRepository<T> {
         // Delete outdated local p branch, a-# branches and b-# branches
         let finalized_branch_commit_hash =
             self.raw.locate_branch(FINALIZED_BRANCH_NAME.into()).await?;
-
-        let branches = self.raw.list_branches().await?;
-
-        // delete outdated p branch, a-# branches, b-# branches
-        for branch in branches {
+        let branches = retrieve_local_branches(&self.raw).await?;
+        for (branch, branch_commit_hash) in branches {
             if !(branch.as_str() == WORK_BRANCH_NAME
                 || branch.as_str() == FINALIZED_BRANCH_NAME
                 || branch.as_str() == FP_BRANCH_NAME)
-            {
-                let branch_commit = self.raw.locate_branch(branch.clone()).await?;
-
-                if finalized_branch_commit_hash
+                && finalized_branch_commit_hash
                     != self
                         .raw
-                        .find_merge_base(branch_commit, finalized_branch_commit_hash)
+                        .find_merge_base(branch_commit_hash, finalized_branch_commit_hash)
                         .await?
-                {
-                    self.raw.delete_branch(branch.to_string()).await?;
-                }
+            {
+                self.raw.delete_branch(branch.to_string()).await?;
             }
         }
 
