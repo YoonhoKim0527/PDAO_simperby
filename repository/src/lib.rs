@@ -201,6 +201,7 @@ impl<T: RawRepository> DistributedRepository<T> {
     /// - the `b-#` branches
     /// if only the branches are not outdated (branched from the last finalized commit).
     pub async fn clean(&mut self) -> Result<(), Error> {
+        // Delete outdated local p branch, a-# branches and b-# branches
         let finalized_branch_commit_hash =
             self.raw.locate_branch(FINALIZED_BRANCH_NAME.into()).await?;
 
@@ -225,7 +226,8 @@ impl<T: RawRepository> DistributedRepository<T> {
             }
         }
 
-        // remove remote branches
+        // Remove remote repositories
+        // Note that remote branches are automatically removed when the remote repository is removed.
         let remote_list = self.raw.list_remotes().await?;
         for (remote_name, _) in remote_list {
             self.raw.remove_remote(remote_name).await?;
