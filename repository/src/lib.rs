@@ -205,6 +205,7 @@ impl<T: RawRepository> DistributedRepository<T> {
         let finalized_branch_commit_hash =
             self.raw.locate_branch(FINALIZED_BRANCH_NAME.into()).await?;
         let branches = retrieve_local_branches(&self.raw).await?;
+        let last_header = self.get_last_finalized_block_header().await?;
         for (branch, branch_commit_hash) in branches {
             if !(branch.as_str() == WORK_BRANCH_NAME
                 || branch.as_str() == FINALIZED_BRANCH_NAME
@@ -217,6 +218,22 @@ impl<T: RawRepository> DistributedRepository<T> {
             {
                 self.raw.delete_branch(branch.to_string()).await?;
             }
+
+            // Delete branch with invalid commit sequence
+            let reserved_state = self.get_reserved_state().await?;
+            let commits =
+                read_commits(self, finalized_branch_commit_hash, branch_commit_hash).await?;
+            let mut verifier =
+                CommitSequenceVerifier::new(last_header.clone(), reserved_state.clone())
+                    .map_err(|e| eyre!("failed to create a commit sequence verifier: {}", e))?;
+            for (commit, _) in commits.iter() {
+                if verifier.apply_commit(commit).is_err() {
+                    self.raw
+                        .delete_branch(branch.to_string())
+                        .await
+                        .map_err(|e| eyre!("failed to delete branch: {}", e))?;
+                }
+            }
         }
 
         // Remove remote repositories
@@ -225,8 +242,6 @@ impl<T: RawRepository> DistributedRepository<T> {
         for (remote_name, _) in remote_list {
             self.raw.remove_remote(remote_name).await?;
         }
-
-        // TODO : CSV
 
         Ok(())
     }
